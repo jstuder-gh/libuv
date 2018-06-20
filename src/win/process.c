@@ -1176,6 +1176,39 @@ int uv_spawn(uv_loop_t* loop,
   return uv_translate_sys_error(err);
 }
 
+static int uv__kill_sigkill(HANDLE process_handle) {
+  /* Unconditionally terminate the process. On Windows, killed processes
+   * normally return 1. */
+  DWORD status;
+  int err;
+
+  if (TerminateProcess(process_handle, 1))
+    return 0;
+
+  /* If the process already exited before TerminateProcess was called,.
+   * TerminateProcess will fail with ERROR_ACCESS_DENIED. */
+  err = GetLastError();
+  if (err == ERROR_ACCESS_DENIED &&
+      GetExitCodeProcess(process_handle, &status) &&
+      status != STILL_ACTIVE) {
+    return UV_ESRCH;
+  }
+
+  return uv_translate_sys_error(err);
+}
+
+static int uv__kill_checkhealth(HANDLE process_handle) {
+  /* Health check: is the process still alive? */
+  DWORD status;
+
+  if (!GetExitCodeProcess(process_handle, &status))
+    return uv_translate_sys_error(GetLastError());
+
+  if (status != STILL_ACTIVE)
+    return UV_ESRCH;
+
+  return 0;
+}
 
 static int uv__kill(HANDLE process_handle, int signum) {
   if (signum < 0 || signum >= NSIG) {
@@ -1185,39 +1218,11 @@ static int uv__kill(HANDLE process_handle, int signum) {
   switch (signum) {
     case SIGTERM:
     case SIGKILL:
-    case SIGINT: {
-      /* Unconditionally terminate the process. On Windows, killed processes */
-      /* normally return 1. */
-      DWORD status;
-      int err;
+    case SIGINT:
+      return uv__kill_sigkill(process_handle);
 
-      if (TerminateProcess(process_handle, 1))
-        return 0;
-
-      /* If the process already exited before TerminateProcess was called, */
-      /* TerminateProcess will fail with ERROR_ACCESS_DENIED. */
-      err = GetLastError();
-      if (err == ERROR_ACCESS_DENIED &&
-          GetExitCodeProcess(process_handle, &status) &&
-          status != STILL_ACTIVE) {
-        return UV_ESRCH;
-      }
-
-      return uv_translate_sys_error(err);
-    }
-
-    case 0: {
-      /* Health check: is the process still alive? */
-      DWORD status;
-
-      if (!GetExitCodeProcess(process_handle, &status))
-        return uv_translate_sys_error(GetLastError());
-
-      if (status != STILL_ACTIVE)
-        return UV_ESRCH;
-
-      return 0;
-    }
+    case 0:
+      return uv__kill_checkhealth(process_handle);
 
     default:
       /* Unsupported signal. */
@@ -1225,6 +1230,39 @@ static int uv__kill(HANDLE process_handle, int signum) {
   }
 }
 
+static int uv__kill_self(HANDLE process_handle, int signum) {
+  if (signum < 0 || signum >= NSIG) {
+    return UV_EINVAL;
+  }
+
+  switch (signum) {
+    case SIGKILL:
+      return uv__kill_sigkill(process_handle);
+    case SIGWINCH:
+      return uv__signal_dispatch(signum);
+    case SIGHUP:
+    case SIGINT:
+    case SIGILL:
+    case SIGFPE:
+    case SIGSEGV:
+    case SIGTERM:
+    case SIGBREAK:
+    case SIGABRT: {
+      int dispatched = uv__signal_dispatch(signum);
+      if (!dispatched) {
+          return uv__kill_sigkill(process_handle);
+      }
+      return 0;
+    }
+
+    case 0:
+      return uv__kill_checkhealth(process_handle);
+
+    default:
+      /* Unsupported signal. */
+      return UV_ENOSYS;
+  }
+}
 
 int uv_process_kill(uv_process_t* process, int signum) {
   int err;
@@ -1245,7 +1283,7 @@ int uv_process_kill(uv_process_t* process, int signum) {
 
 
 int uv_kill(int pid, int signum) {
-  int err;
+  int err = UV_UNKNOWN;
   HANDLE process_handle;
 
   if (pid == 0) {
@@ -1265,7 +1303,12 @@ int uv_kill(int pid, int signum) {
     }
   }
 
-  err = uv__kill(process_handle, signum);
+  if (pid == uv_os_getpid()) {
+    err = uv__kill_self(process_handle, signum);
+  }
+  else {
+    err = uv__kill(process_handle, signum);
+  }
   CloseHandle(process_handle);
 
   return err;  /* err is already translated. */
