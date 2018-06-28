@@ -1182,8 +1182,11 @@ static int uv__kill_sigkill(HANDLE process_handle) {
   DWORD status;
   int err;
 
-  if (TerminateProcess(process_handle, 1))
-    return 0;
+  if (TerminateProcess(process_handle, 1)) {
+    if (WaitForSingleObject(process_handle, 1000) != WAIT_OBJECT_0)
+        if ( CancelIoEx(process_handle, NULL) )
+            return 0;
+  }
 
   /* If the process already exited before TerminateProcess was called,.
    * TerminateProcess will fail with ERROR_ACCESS_DENIED. */
